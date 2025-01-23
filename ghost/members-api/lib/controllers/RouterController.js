@@ -1,6 +1,5 @@
 const tpl = require('@tryghost/tpl');
 const logging = require('@tryghost/logging');
-const _ = require('lodash');
 const {BadRequestError, NoPermissionError, UnauthorizedError, DisabledFeatureError} = require('@tryghost/errors');
 const errors = require('@tryghost/errors');
 
@@ -10,10 +9,12 @@ const messages = {
     notFound: 'Not Found.',
     offerNotFound: 'This offer does not exist.',
     offerArchived: 'This offer is archived.',
+    tierNotFound: 'This tier does not exist.',
     tierArchived: 'This tier is archived.',
     existingSubscription: 'A subscription exists for this Member.',
     unableToCheckout: 'Unable to initiate checkout session',
     inviteOnly: 'This site is invite-only, contact the owner for access.',
+    paidOnly: 'This site only accepts paid members.',
     memberNotFound: 'No member exists with this e-mail address.',
     memberNotFoundSignUp: 'No member exists with this e-mail address. Please sign up first.',
     invalidType: 'Invalid checkout type.',
@@ -39,6 +40,8 @@ module.exports = class RouterController {
      * @param {any} deps.sendEmailWithMagicLink
      * @param {{isSet(name: string): boolean}} deps.labsService
      * @param {any} deps.newslettersService
+     * @param {any} deps.sentry
+     * @param {any} deps.settingsCache
      */
     constructor({
         offersAPI,
@@ -53,7 +56,9 @@ module.exports = class RouterController {
         memberAttributionService,
         sendEmailWithMagicLink,
         labsService,
-        newslettersService
+        newslettersService,
+        sentry,
+        settingsCache
     }) {
         this._offersAPI = offersAPI;
         this._paymentsService = paymentsService;
@@ -68,6 +73,8 @@ module.exports = class RouterController {
         this._memberAttributionService = memberAttributionService;
         this.labsService = labsService;
         this._newslettersService = newslettersService;
+        this._sentry = sentry || undefined;
+        this._settingsCache = settingsCache;
     }
 
     async ensureStripe(_req, res, next) {
@@ -79,6 +86,7 @@ module.exports = class RouterController {
             await this._stripeAPIService.ready();
             next();
         } catch (err) {
+            logging.error(err);
             res.writeHead(500);
             return res.end('There was an error configuring stripe');
         }
@@ -101,6 +109,7 @@ module.exports = class RouterController {
                 email = claims && claims.sub;
             }
         } catch (err) {
+            logging.error(err);
             res.writeHead(401);
             return res.end('Unauthorized');
         }
@@ -258,9 +267,24 @@ module.exports = class RouterController {
 
             tier = await this._tiersService.api.read(offer.tier.id);
             cadence = offer.cadence;
-        } else {
+        } else if (tierId) {
             offer = null;
-            tier = await this._tiersService.api.read(tierId);
+
+            try {
+                // If the tierId is not a valid ID, the following line will throw
+                tier = await this._tiersService.api.read(tierId);
+
+                if (!tier) {
+                    throw undefined;
+                }
+            } catch (err) {
+                logging.error(err);
+                this._sentry?.captureException?.(err);
+                throw new BadRequestError({
+                    message: tpl(messages.tierNotFound),
+                    context: 'Tier with id "' + tierId + '" not found'
+                });
+            }
         }
 
         if (tier.status === 'archived') {
@@ -337,6 +361,8 @@ module.exports = class RouterController {
 
             return {url: paymentLink};
         } catch (err) {
+            logging.error(err);
+            this._sentry?.captureException?.(err);
             throw new BadRequestError({
                 err,
                 message: tpl(messages.unableToCheckout)
@@ -367,6 +393,8 @@ module.exports = class RouterController {
 
             return {url: paymentLink};
         } catch (err) {
+            logging.error(err);
+            this._sentry?.captureException?.(err);
             throw new BadRequestError({
                 err,
                 message: tpl(messages.unableToCheckout)
@@ -404,6 +432,8 @@ module.exports = class RouterController {
                         isAuthenticated = true;
                     }
                 } catch (err) {
+                    logging.error(err);
+                    this._sentry?.captureException?.(err);
                     throw new UnauthorizedError({err});
                 }
             } else if (req.body.customerEmail) {
@@ -456,17 +486,17 @@ module.exports = class RouterController {
     }
 
     async sendMagicLink(req, res) {
-        const {email, autoRedirect} = req.body;
+        const {email, honeypot, autoRedirect} = req.body;
         let {emailType, redirect} = req.body;
 
-        let referer = req.get('referer');
+        let referrer = req.get('referer');
         if (autoRedirect === false){
-            referer = null;
+            referrer = null;
         }
         if (redirect) {
             try {
                 // Validate URL
-                referer = new URL(redirect).href;
+                referrer = new URL(redirect).href;
             } catch (e) {
                 logging.warn(e);
             }
@@ -478,13 +508,18 @@ module.exports = class RouterController {
             });
         }
 
+        if (honeypot) {
+            logging.warn('Honeypot field filled, this is likely a bot');
+
+            // Honeypot field is filled, this is a bot.
+            // Pretend that the email was sent successfully.
+            res.writeHead(201);
+            return res.end('Created.');
+        }
+
         if (!emailType) {
             // Default to subscribe form that also allows to login (safe fallback for older clients)
-            if (!this._allowSelfSignup()) {
-                emailType = 'signin';
-            } else {
-                emailType = 'subscribe';
-            }
+            emailType = 'subscribe';
         }
 
         if (!['signin', 'signup', 'subscribe'].includes(emailType)) {
@@ -494,84 +529,102 @@ module.exports = class RouterController {
 
         try {
             if (emailType === 'signup' || emailType === 'subscribe') {
-                if (!this._allowSelfSignup()) {
-                    throw new errors.BadRequestError({
-                        message: tpl(messages.inviteOnly)
-                    });
-                }
-
-                // Validate requested newsletters
-                let {newsletters: requestedNewsletters} = req.body;
-
-                if (requestedNewsletters && requestedNewsletters.length > 0 && requestedNewsletters.every(newsletter => newsletter.name !== undefined)) {
-                    const newsletterNames = requestedNewsletters.map(newsletter => newsletter.name);
-                    const newsletterNamesFilter = newsletterNames.map(newsletter => `'${newsletter.replace(/("|')/g, '\\$1')}'`);
-                    const newsletters = (await this._newslettersService.getAll({
-                        filter: `name:[${newsletterNamesFilter}]`,
-                        columns: ['id','name','status']
-                    }));
-
-                    if (newsletters.length !== newsletterNames.length) { //check for invalid newsletters
-                        const validNewsletters = newsletters.map(newsletter => newsletter.name);
-                        const invalidNewsletters = newsletterNames.filter(newsletter => !validNewsletters.includes(newsletter));
-
-                        throw new errors.BadRequestError({
-                            message: tpl(messages.invalidNewsletters, {newsletters: invalidNewsletters})
-                        });
-                    }
-
-                    //validation for archived newsletters
-                    const archivedNewsletters = newsletters
-                        .filter(newsletter => newsletter.status === 'archived')
-                        .map(newsletter => newsletter.name);
-                    if (archivedNewsletters && archivedNewsletters.length > 0) {
-                        throw new errors.BadRequestError({
-                            message: tpl(messages.archivedNewsletters, {newsletters: archivedNewsletters})
-                        });
-                    }
-
-                    requestedNewsletters = newsletters
-                        .filter(newsletter => newsletter.status === 'active')
-                        .map(newsletter => ({id: newsletter.id}));
-                }
-
-                // Someone tries to signup with a user that already exists
-                // -> doesn't really matter: we'll send a login link
-                const tokenData = _.pick(req.body, ['labels', 'name']);
-                if (req.ip) {
-                    tokenData.reqIp = req.ip;
-                }
-                tokenData.newsletters = requestedNewsletters;
-                // Save attribution data in the tokenData
-                tokenData.attribution = await this._memberAttributionService.getAttribution(req.body.urlHistory);
-
-                await this._sendEmailWithMagicLink({email, tokenData, requestedType: emailType, referrer: referer});
-
-                res.writeHead(201);
-                return res.end('Created.');
+                await this._handleSignup(req, referrer);
+            } else {
+                await this._handleSignin(req, referrer);
             }
 
-            // Signin
-            const member = await this._memberRepository.get({email});
-            if (member) {
-                const tokenData = {};
-                await this._sendEmailWithMagicLink({email, tokenData, requestedType: emailType, referrer: referer});
-                res.writeHead(201);
-                return res.end('Created.');
-            }
-
-            throw new errors.BadRequestError({
-                message: this._allowSelfSignup() ? tpl(messages.memberNotFoundSignUp) : tpl(messages.memberNotFound)
-            });
+            res.writeHead(201);
+            return res.end('Created.');
         } catch (err) {
             if (err.code === 'EENVELOPE') {
                 logging.error(err);
                 res.writeHead(400);
                 return res.end('Bad Request.');
             }
+            logging.error(err);
 
             // Let the normal error middleware handle this error
             throw err;
+        }
+    }
+
+    async _handleSignup(req, referrer = null) {
+        if (!this._allowSelfSignup()) {
+            if (this._settingsCache.get('members_signup_access') === 'paid') {
+                throw new errors.BadRequestError({
+                    message: tpl(messages.paidOnly)
+                });
+            } else {
+                throw new errors.BadRequestError({
+                    message: tpl(messages.inviteOnly)
+                });
+            }
+        }
+
+        const {email, emailType} = req.body;
+
+        const tokenData = {
+            labels: req.body.labels,
+            name: req.body.name,
+            reqIp: req.ip ?? undefined,
+            newsletters: await this._validateNewsletters(req),
+            attribution: await this._memberAttributionService.getAttribution(req.body.urlHistory)
+        };
+
+        return await this._sendEmailWithMagicLink({email, tokenData, requestedType: emailType, referrer});
+    }
+
+    async _handleSignin(req, referrer = null) {
+        const {email, emailType} = req.body;
+
+        const member = await this._memberRepository.get({email});
+
+        if (!member) {
+            throw new errors.BadRequestError({
+                message: this._allowSelfSignup() ? tpl(messages.memberNotFoundSignUp) : tpl(messages.memberNotFound)
+            });
+        }
+
+        const tokenData = {};
+        await this._sendEmailWithMagicLink({email, tokenData, requestedType: emailType, referrer});
+    }
+
+    async _validateNewsletters(req) {
+        const {newsletters: requestedNewsletters} = req.body;
+
+        if (requestedNewsletters && requestedNewsletters.length > 0 && requestedNewsletters.every(newsletter => newsletter.name !== undefined)) {
+            const newsletterNames = requestedNewsletters.map(newsletter => newsletter.name);
+            const newsletterNamesFilter = newsletterNames.map(newsletter => `'${newsletter.replace(/("|')/g, '\\$1')}'`);
+            const newsletters = (await this._newslettersService.getAll({
+                filter: `name:[${newsletterNamesFilter}]`,
+                columns: ['id','name','status']
+            }));
+
+            // Check for invalid newsletters
+            if (newsletters.length !== newsletterNames.length) {
+                const validNewsletters = newsletters.map(newsletter => newsletter.name);
+                const invalidNewsletters = newsletterNames.filter(newsletter => !validNewsletters.includes(newsletter));
+
+                throw new errors.BadRequestError({
+                    message: tpl(messages.invalidNewsletters, {newsletters: invalidNewsletters})
+                });
+            }
+
+            // Check for archived newsletters
+            const archivedNewsletters = newsletters
+                .filter(newsletter => newsletter.status === 'archived')
+                .map(newsletter => newsletter.name);
+
+            if (archivedNewsletters && archivedNewsletters.length > 0) {
+                throw new errors.BadRequestError({
+                    message: tpl(messages.archivedNewsletters, {newsletters: archivedNewsletters})
+                });
+            }
+
+            return newsletters
+                .filter(newsletter => newsletter.status === 'active')
+                .map(newsletter => ({id: newsletter.id}));
         }
     }
 };

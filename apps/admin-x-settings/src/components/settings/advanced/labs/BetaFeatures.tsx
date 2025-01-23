@@ -16,10 +16,6 @@ const BetaFeatures: React.FC = () => {
     return (
         <List titleSeparator={false}>
             <LabItem
-                action={<FeatureToggle flag="internalLinking" />}
-                detail={<>Search and link to your own content directly inside the editor — so that your workflow is never interrupted</>}
-                title='Internal linking' />
-            <LabItem
                 action={<FeatureToggle flag="editorExcerpt" />}
                 detail={<>Adds the excerpt input below the post title in the editor</>}
                 title='Show post excerpt inline' />
@@ -27,10 +23,6 @@ const BetaFeatures: React.FC = () => {
                 action={<FeatureToggle flag="additionalPaymentMethods" />}
                 detail={<>Enable support for CashApp, iDEAL, Bancontact, and others. <a className='text-green' href="https://ghost.org/help/payment-methods" rel="noopener noreferrer" target="_blank">Learn more &rarr;</a></>}
                 title='Additional payment methods' />
-            <LabItem
-                action={<FeatureToggle flag='i18n' />}
-                detail={<>Translate your membership flows into your publication language (<a className='text-green' href="https://github.com/TryGhost/Ghost/tree/main/ghost/i18n/locales" rel="noopener noreferrer" target="_blank">supported languages</a>). Don’t see yours? <a className='text-green' href="https://forum.ghost.org/t/help-translate-ghost-beta/37461" rel="noopener noreferrer" target="_blank">Get involved</a></>}
-                title='Portal translation' />
             <LabItem
                 action={<div className='flex flex-col items-end gap-1'>
                     <FileUpload
